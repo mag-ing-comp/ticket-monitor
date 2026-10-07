@@ -42,6 +42,7 @@ MATCH_RULES: list[set[str]] = [
     {"hajduk"},
     {"lincoln", "red imps"},
     {"uefa", "conference"},
+    {"hush"},  # TEST
 ]
 ALL_KEYWORDS = ["hajduk", "split", "lincoln red imps", "uefa", "conference"]
 
