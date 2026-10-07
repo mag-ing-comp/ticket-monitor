@@ -39,12 +39,37 @@ BASE_URL = "https://www.buytickets.gi"
 PAGES_TO_SCAN = [f"{BASE_URL}/events", f"{BASE_URL}/"]
 
 # An event matches if ANY rule is fully present in its title + URL slug.
+# An event alerts if ANY rule matches: every term in that rule must appear in the
+# title or URL slug (case- and accent-insensitive). Terms of 4 chars or fewer must
+# match as a whole word, so "hnk" or "lri" never fire inside longer words.
+# The site lists only ~20 events, so broad rules cost at most an occasional extra alert.
 MATCH_RULES: list[set[str]] = [
+    # The opponent
     {"hajduk"},
-    {"lincoln", "red imps"},
-    {"uefa", "conference"},
+    {"hnk"},                          # "HNK Split" style naming
+    {"split", "croatia"},             # "Split" alone is too generic (e.g. "split ticket")
+    {"split", "hrvatska"},
+    # The home club, however it is written
+    {"lincoln"},
+    {"red imps"},
+    {"imps"},
+    {"lri"},
+    # The competition
+    {"uefa"},                         # also catches Gibraltar national-team UEFA games
+    {"conference league"},
+    {"uecl"},
+    {"europa", "conference"},         # older "Europa Conference League" naming
+    # The venue, if the listing names only the stadium
+    {"europa point stadium"},
+    {"victoria stadium"},
 ]
-ALL_KEYWORDS = ["hajduk", "split", "lincoln red imps", "uefa", "conference"]
+ALL_KEYWORDS = sorted({t for rule in MATCH_RULES for t in rule})
+
+
+def term_in(term: str, hay: str) -> bool:
+    if len(term) <= 4:
+        return re.search(rf"\b{re.escape(term)}\b", hay) is not None
+    return term in hay
 
 STATE_FILE = Path(__file__).with_name("seen.json")
 HEADERS = {
@@ -73,7 +98,7 @@ def normalize(text: str) -> str:
 
 
 def is_match(e: Event) -> bool:
-    return any(all(term in e.haystack for term in rule) for rule in MATCH_RULES)
+    return any(all(term_in(term, e.haystack) for term in rule) for rule in MATCH_RULES)
 
 
 EVENT_URL_RE = re.compile(r"/events?/[^/]+-\d+/?$", re.I)  # e.g. /events/the-hush-1362
@@ -86,9 +111,7 @@ def diagnose() -> None:
         soup = BeautifulSoup(r.text, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else "(no <title>)"
         hrefs = [a["href"] for a in soup.find_all("a", href=True)]
-        print(
-            f"--- {r.url} | HTTP {r.status_code} | {len(r.text)} chars | title: {title}"
-        )
+        print(f"--- {r.url} | HTTP {r.status_code} | {len(r.text)} chars | title: {title}")
         print(f"    {len(hrefs)} links, sample: {hrefs[:15]}")
         if len(hrefs) < 5:
             print("    body start:", " ".join(r.text.split())[:600])
@@ -122,23 +145,14 @@ def notify(title: str, body: str, url: str = "") -> bool:
     # Tolerate common secret-pasting mistakes: whitespace, newlines, a full "https://ntfy.sh/x" URL.
     topic = (os.getenv("NTFY_TOPIC") or "").strip().rstrip("/").split("/")[-1]
     if not topic:
-        print(
-            "NTFY_TOPIC is empty in this run: check the repository secret name/value."
-        )
+        print("NTFY_TOPIC is empty in this run: check the repository secret name/value.")
     else:
-        print(
-            f"ntfy topic: {topic[:4]}...{topic[-2:]} (len {len(topic)})"
-        )  # masked, for checking
+        print(f"ntfy topic: {topic[:4]}...{topic[-2:]} (len {len(topic)})")  # masked, for checking
         headers = {"Title": title, "Priority": "urgent", "Tags": "soccer,ticket"}
         if url:
             headers["Click"] = url
         try:
-            r = requests.post(
-                f"https://ntfy.sh/{topic}",
-                data=body.encode(),
-                headers=headers,
-                timeout=10,
-            )
+            r = requests.post(f"https://ntfy.sh/{topic}", data=body.encode(), headers=headers, timeout=10)
             print(f"ntfy response: HTTP {r.status_code} {r.text[:200]}")
             sent |= r.ok
         except requests.RequestException as e:
@@ -163,13 +177,8 @@ def load_seen() -> set[str]:
 
 
 FAIL_FILE = Path(__file__).with_name(".failures")
-FAIL_ALERT_AFTER = int(
-    os.getenv("FAIL_ALERT_AFTER", "4")
-)  # 4 runs x 15 min = ~1h blocked
-EXIT_SOFT_FAIL, EXIT_HARD_FAIL = (
-    1,
-    2,
-)  # soft: blocked/unreachable (expected now and then)
+FAIL_ALERT_AFTER = int(os.getenv("FAIL_ALERT_AFTER", "4"))  # 4 runs x 15 min = ~1h blocked
+EXIT_SOFT_FAIL, EXIT_HARD_FAIL = 1, 2  # soft: blocked/unreachable (expected now and then)
 
 
 def is_bot_challenge(r: requests.Response) -> bool:
@@ -184,26 +193,17 @@ def track_failures(rc: int) -> int:
         n = 0
     if rc == 0:
         if n >= FAIL_ALERT_AFTER:
-            notify(
-                "Hajduk monitor recovered",
-                "Checks are working again.",
-                f"{BASE_URL}/events",
-            )
+            notify("Hajduk monitor recovered", "Checks are working again.", f"{BASE_URL}/events")
         FAIL_FILE.write_text("0")  # write 0 (not delete) so the cached state resets too
         return 0
     n += 1
     FAIL_FILE.write_text(str(n))
     if n == FAIL_ALERT_AFTER:
-        reason = (
-            "the site is showing a bot check (captcha)"
-            if any(is_bot_challenge(r) for r in RAW_PAGES)
-            else "see monitor.log"
-        )
-        notify(
-            "Hajduk monitor is FAILING",
-            f"{n} failed checks in a row: {reason}. Check the site manually meanwhile.",
-            f"{BASE_URL}/events",
-        )
+        reason = ("the site is showing a bot check (captcha)"
+                  if any(is_bot_challenge(r) for r in RAW_PAGES) else "see monitor.log")
+        notify("Hajduk monitor is FAILING",
+               f"{n} failed checks in a row: {reason}. Check the site manually meanwhile.",
+               f"{BASE_URL}/events")
     return n
 
 
@@ -213,13 +213,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.test_notify:
-        return (
-            0
-            if notify(
-                "Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events"
-            )
-            else 1
-        )
+        return 0 if notify("Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events") else 1
 
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]", end=" ")
     rc = run_check()
@@ -246,9 +240,7 @@ def run_check() -> int:
     if not events:
         # Zero events usually means the layout changed or we got a bot/cookie page.
         if any(is_bot_challenge(r) for r in RAW_PAGES):
-            print(
-                "Blocked by the site's bot protection (SiteGround captcha); not retrying around it."
-            )
+            print("Blocked by the site's bot protection (SiteGround captcha); not retrying around it.")
         else:
             print("Parsed 0 events; page structure may have changed.")
             diagnose()
@@ -256,11 +248,8 @@ def run_check() -> int:
         for r in RAW_PAGES:
             key = f"raw:{r.url}"
             if "hajduk" in normalize(r.text) and key not in seen:
-                if notify(
-                    "Possible Hajduk listing on buytickets.gi",
-                    "Keyword found on the page (parser could not read event cards).",
-                    r.url,
-                ):
+                if notify("Possible Hajduk listing on buytickets.gi",
+                          "Keyword found on the page (parser could not read event cards).", r.url):
                     seen.add(key)
                     STATE_FILE.write_text(json.dumps(sorted(seen), indent=2) + "\n")
         return EXIT_SOFT_FAIL
@@ -269,13 +258,9 @@ def run_check() -> int:
     print(f"Scanned {len(events)} events, {len(hits)} new match(es).")
 
     for e in hits:
-        kws = ", ".join(k for k in ALL_KEYWORDS if k in e.haystack)
+        kws = ", ".join(k for k in ALL_KEYWORDS if term_in(k, e.haystack))
         when = f" ({e.date})" if e.date else ""
-        if notify(
-            "Hajduk tickets are LIVE on buytickets.gi",
-            f"{e.title}{when}\nMatched: {kws}",
-            e.url,
-        ):
+        if notify("Hajduk tickets are LIVE on buytickets.gi", f"{e.title}{when}\nMatched: {kws}", e.url):
             seen.add(e.url)  # only mark seen once the alert actually went out
 
     if hits:
@@ -283,9 +268,7 @@ def run_check() -> int:
     undelivered = [e for e in hits if e.url not in seen]
     if undelivered:
         # Turn the run red so GitHub's failure email acts as a backup alert.
-        print(
-            f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}"
-        )
+        print(f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}")
         return EXIT_HARD_FAIL
     return 0
 
