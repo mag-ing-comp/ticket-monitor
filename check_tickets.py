@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import unicodedata
 from dataclasses import dataclass
@@ -74,15 +75,35 @@ def is_match(e: Event) -> bool:
     return any(all(term in e.haystack for term in rule) for rule in MATCH_RULES)
 
 
+EVENT_URL_RE = re.compile(r"/events?/[^/]+-\d+/?$", re.I)  # e.g. /events/the-hush-1362
+RAW_PAGES: list[requests.Response] = []  # kept for diagnostics and raw-text fallback
+
+
+def diagnose() -> None:
+    """Print what the server actually returned, so a failed run explains itself."""
+    for r in RAW_PAGES:
+        soup = BeautifulSoup(r.text, "html.parser")
+        title = soup.title.get_text(strip=True) if soup.title else "(no <title>)"
+        hrefs = [a["href"] for a in soup.find_all("a", href=True)]
+        print(
+            f"--- {r.url} | HTTP {r.status_code} | {len(r.text)} chars | title: {title}"
+        )
+        print(f"    {len(hrefs)} links, sample: {hrefs[:15]}")
+        if len(hrefs) < 5:
+            print("    body start:", " ".join(r.text.split())[:600])
+
+
 def fetch_events(session: requests.Session) -> list[Event]:
     events: dict[str, Event] = {}
     for page in PAGES_TO_SCAN:
         resp = session.get(page, headers=HEADERS, timeout=20)
         resp.raise_for_status()
+        RAW_PAGES.append(resp)
         soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.select('a[href*="/events/"]'):
-            href = urljoin(BASE_URL, a.get("href", ""))
-            if href.rstrip("/").endswith("/events"):
+        for a in soup.find_all("a", href=True):
+            # Resolve relative links ("events/x-12", "/events/x-12", absolute) the same way.
+            href = urljoin(resp.url, a["href"]).split("#")[0].split("?")[0]
+            if not EVENT_URL_RE.search(href):
                 continue
             title = (a.get("title") or a.get_text(" ", strip=True)).strip()
             if not title:
@@ -101,7 +122,9 @@ def notify(title: str, body: str, url: str = "") -> bool:
         headers = {"Title": title, "Priority": "urgent", "Tags": "soccer,ticket"}
         if url:
             headers["Click"] = url
-        r = requests.post(f"https://ntfy.sh/{topic}", data=body.encode(), headers=headers, timeout=10)
+        r = requests.post(
+            f"https://ntfy.sh/{topic}", data=body.encode(), headers=headers, timeout=10
+        )
         sent |= r.ok
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
@@ -128,7 +151,13 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.test_notify:
-        return 0 if notify("Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events") else 1
+        return (
+            0
+            if notify(
+                "Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events"
+            )
+            else 1
+        )
 
     try:
         events = fetch_events(requests.Session())
@@ -136,19 +165,35 @@ def main() -> int:
         print(f"Fetch failed: {e}", file=sys.stderr)
         return 1
 
-    if not events:
-        # Zero events usually means the page layout changed; fail loudly rather than go silent.
-        print("Parsed 0 events; page structure may have changed.", file=sys.stderr)
-        return 1
-
     seen = load_seen()
+
+    if not events:
+        # Zero events usually means the layout changed or we got a bot/cookie page.
+        print("Parsed 0 events; page structure may have changed.", file=sys.stderr)
+        diagnose()
+        # Safety net: even if card parsing breaks, never miss the keyword itself.
+        for r in RAW_PAGES:
+            key = f"raw:{r.url}"
+            if "hajduk" in normalize(r.text) and key not in seen:
+                if notify(
+                    "Possible Hajduk listing on buytickets.gi",
+                    "Keyword found on the page (parser could not read event cards).",
+                    r.url,
+                ):
+                    seen.add(key)
+                    STATE_FILE.write_text(json.dumps(sorted(seen), indent=2) + "\n")
+        return 1
     hits = [e for e in events if is_match(e) and e.url not in seen]
     print(f"Scanned {len(events)} events, {len(hits)} new match(es).")
 
     for e in hits:
         kws = ", ".join(k for k in ALL_KEYWORDS if k in e.haystack)
         when = f" ({e.date})" if e.date else ""
-        if notify("Hajduk tickets are LIVE on buytickets.gi", f"{e.title}{when}\nMatched: {kws}", e.url):
+        if notify(
+            "Hajduk tickets are LIVE on buytickets.gi",
+            f"{e.title}{when}\nMatched: {kws}",
+            e.url,
+        ):
             seen.add(e.url)  # only mark seen once the alert actually went out
 
     if hits:
