@@ -2,7 +2,7 @@ name: Hajduk ticket monitor
 
 on:
   schedule:
-    - cron: "*/10 * * * *"  # every 10 min (runs can lag a few minutes under load)
+    - cron: "*/3-59/10 * * * *"  # every 10 min (runs can lag a few minutes under load)
   workflow_dispatch:         # "Run workflow" button for manual tests
 
 permissions:
