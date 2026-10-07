@@ -42,7 +42,6 @@ MATCH_RULES: list[set[str]] = [
     {"hajduk"},
     {"lincoln", "red imps"},
     {"uefa", "conference"},
-    {"hush"},  # TEMP test rule: remove after the notification test
 ]
 ALL_KEYWORDS = ["hajduk", "split", "lincoln red imps", "uefa", "conference"]
 
@@ -86,7 +85,9 @@ def diagnose() -> None:
         soup = BeautifulSoup(r.text, "html.parser")
         title = soup.title.get_text(strip=True) if soup.title else "(no <title>)"
         hrefs = [a["href"] for a in soup.find_all("a", href=True)]
-        print(f"--- {r.url} | HTTP {r.status_code} | {len(r.text)} chars | title: {title}")
+        print(
+            f"--- {r.url} | HTTP {r.status_code} | {len(r.text)} chars | title: {title}"
+        )
         print(f"    {len(hrefs)} links, sample: {hrefs[:15]}")
         if len(hrefs) < 5:
             print("    body start:", " ".join(r.text.split())[:600])
@@ -120,14 +121,23 @@ def notify(title: str, body: str, url: str = "") -> bool:
     # Tolerate common secret-pasting mistakes: whitespace, newlines, a full "https://ntfy.sh/x" URL.
     topic = (os.getenv("NTFY_TOPIC") or "").strip().rstrip("/").split("/")[-1]
     if not topic:
-        print("NTFY_TOPIC is empty in this run: check the repository secret name/value.")
+        print(
+            "NTFY_TOPIC is empty in this run: check the repository secret name/value."
+        )
     else:
-        print(f"ntfy topic: {topic[:4]}...{topic[-2:]} (len {len(topic)})")  # masked, for checking
+        print(
+            f"ntfy topic: {topic[:4]}...{topic[-2:]} (len {len(topic)})"
+        )  # masked, for checking
         headers = {"Title": title, "Priority": "urgent", "Tags": "soccer,ticket"}
         if url:
             headers["Click"] = url
         try:
-            r = requests.post(f"https://ntfy.sh/{topic}", data=body.encode(), headers=headers, timeout=10)
+            r = requests.post(
+                f"https://ntfy.sh/{topic}",
+                data=body.encode(),
+                headers=headers,
+                timeout=10,
+            )
             print(f"ntfy response: HTTP {r.status_code} {r.text[:200]}")
             sent |= r.ok
         except requests.RequestException as e:
@@ -157,7 +167,13 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.test_notify:
-        return 0 if notify("Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events") else 1
+        return (
+            0
+            if notify(
+                "Test: Hajduk monitor", "Notifications work.", f"{BASE_URL}/events"
+            )
+            else 1
+        )
 
     try:
         events = fetch_events(requests.Session())
@@ -175,8 +191,11 @@ def main() -> int:
         for r in RAW_PAGES:
             key = f"raw:{r.url}"
             if "hajduk" in normalize(r.text) and key not in seen:
-                if notify("Possible Hajduk listing on buytickets.gi",
-                          "Keyword found on the page (parser could not read event cards).", r.url):
+                if notify(
+                    "Possible Hajduk listing on buytickets.gi",
+                    "Keyword found on the page (parser could not read event cards).",
+                    r.url,
+                ):
                     seen.add(key)
                     STATE_FILE.write_text(json.dumps(sorted(seen), indent=2) + "\n")
         return 1
@@ -186,7 +205,11 @@ def main() -> int:
     for e in hits:
         kws = ", ".join(k for k in ALL_KEYWORDS if k in e.haystack)
         when = f" ({e.date})" if e.date else ""
-        if notify("Hajduk tickets are LIVE on buytickets.gi", f"{e.title}{when}\nMatched: {kws}", e.url):
+        if notify(
+            "Hajduk tickets are LIVE on buytickets.gi",
+            f"{e.title}{when}\nMatched: {kws}",
+            e.url,
+        ):
             seen.add(e.url)  # only mark seen once the alert actually went out
 
     if hits:
@@ -194,7 +217,10 @@ def main() -> int:
     undelivered = [e for e in hits if e.url not in seen]
     if undelivered:
         # Turn the run red so GitHub's failure email acts as a backup alert.
-        print(f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}", file=sys.stderr)
+        print(
+            f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}",
+            file=sys.stderr,
+        )
         return 1
     return 0
 
