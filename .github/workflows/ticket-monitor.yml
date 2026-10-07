@@ -2,20 +2,22 @@ name: Hajduk ticket monitor
 
 on:
   schedule:
-    - cron: "3-59/10 * * * *"  # every 10 min (runs can lag a few minutes under load)
-  workflow_dispatch:         # "Run workflow" button for manual tests
+    # Every 15 min on off-peak minutes (:07 :22 :37 :52). Top-of-hour slots are the
+    # most congested on GitHub and the most likely to be delayed or dropped.
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write            # needed to commit seen.json back
+  contents: write            # commit seen.json back after an alert
 
 concurrency:
-  group: ticket-monitor      # never let two runs race on seen.json
+  group: ticket-monitor
   cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
 
@@ -26,19 +28,35 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # Consecutive-failure counter survives between runs via the Actions cache
+      # (restores the newest "monitor-state-*" entry, saves a fresh one each run).
+      - name: Restore failure counter
+        uses: actions/cache/restore@v4
+        with:
+          path: .failures
+          key: monitor-state-${{ github.run_id }}
+          restore-keys: monitor-state-
+
       - name: Check for tickets
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python check_tickets.py
 
+      - name: Save failure counter
+        if: always() && hashFiles('.failures') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: .failures
+          key: monitor-state-${{ github.run_id }}
+
       - name: Persist seen events
+        if: always()
         run: |
           if [ -n "$(git status --porcelain seen.json)" ]; then
             git config user.name "ticket-bot"
             git config user.email "ticket-bot@users.noreply.github.com"
             git add seen.json
             git commit -m "Record alerted event"
+            git pull --rebase
             git push
           fi

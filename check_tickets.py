@@ -26,6 +26,7 @@ import json
 import os
 import re
 import sys
+import time
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -161,6 +162,51 @@ def load_seen() -> set[str]:
         return set()
 
 
+FAIL_FILE = Path(__file__).with_name(".failures")
+FAIL_ALERT_AFTER = int(
+    os.getenv("FAIL_ALERT_AFTER", "4")
+)  # 4 runs x 15 min = ~1h blocked
+EXIT_SOFT_FAIL, EXIT_HARD_FAIL = (
+    1,
+    2,
+)  # soft: blocked/unreachable (expected now and then)
+
+
+def is_bot_challenge(r: requests.Response) -> bool:
+    return "sgcaptcha" in r.text or (r.status_code == 202 and len(r.text) < 1000)
+
+
+def track_failures(rc: int) -> int:
+    """Count consecutive soft failures; alert once when they persist. Returns the count."""
+    try:
+        n = int(FAIL_FILE.read_text()) if FAIL_FILE.exists() else 0
+    except ValueError:
+        n = 0
+    if rc == 0:
+        if n >= FAIL_ALERT_AFTER:
+            notify(
+                "Hajduk monitor recovered",
+                "Checks are working again.",
+                f"{BASE_URL}/events",
+            )
+        FAIL_FILE.write_text("0")  # write 0 (not delete) so the cached state resets too
+        return 0
+    n += 1
+    FAIL_FILE.write_text(str(n))
+    if n == FAIL_ALERT_AFTER:
+        reason = (
+            "the site is showing a bot check (captcha)"
+            if any(is_bot_challenge(r) for r in RAW_PAGES)
+            else "see monitor.log"
+        )
+        notify(
+            "Hajduk monitor is FAILING",
+            f"{n} failed checks in a row: {reason}. Check the site manually meanwhile.",
+            f"{BASE_URL}/events",
+        )
+    return n
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-notify", action="store_true")
@@ -175,18 +221,37 @@ def main() -> int:
             else 1
         )
 
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]", end=" ")
+    rc = run_check()
+    if rc == EXIT_HARD_FAIL:
+        return 1  # a match we could not alert on: always loud
+    n = track_failures(rc)
+    if rc == 0:
+        return 0
+    if n == FAIL_ALERT_AFTER:
+        return 1  # red run (GitHub email) exactly once, alongside the phone alert
+    print(f"::warning::Check skipped ({n} in a row); will retry next scheduled run.")
+    return 0
+
+
+def run_check() -> int:
     try:
         events = fetch_events(requests.Session())
     except requests.RequestException as e:
-        print(f"Fetch failed: {e}", file=sys.stderr)
-        return 1
+        print(f"Fetch failed: {e}")
+        return EXIT_SOFT_FAIL
 
     seen = load_seen()
 
     if not events:
         # Zero events usually means the layout changed or we got a bot/cookie page.
-        print("Parsed 0 events; page structure may have changed.", file=sys.stderr)
-        diagnose()
+        if any(is_bot_challenge(r) for r in RAW_PAGES):
+            print(
+                "Blocked by the site's bot protection (SiteGround captcha); not retrying around it."
+            )
+        else:
+            print("Parsed 0 events; page structure may have changed.")
+            diagnose()
         # Safety net: even if card parsing breaks, never miss the keyword itself.
         for r in RAW_PAGES:
             key = f"raw:{r.url}"
@@ -198,7 +263,8 @@ def main() -> int:
                 ):
                     seen.add(key)
                     STATE_FILE.write_text(json.dumps(sorted(seen), indent=2) + "\n")
-        return 1
+        return EXIT_SOFT_FAIL
+
     hits = [e for e in events if is_match(e) and e.url not in seen]
     print(f"Scanned {len(events)} events, {len(hits)} new match(es).")
 
@@ -218,10 +284,9 @@ def main() -> int:
     if undelivered:
         # Turn the run red so GitHub's failure email acts as a backup alert.
         print(
-            f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}",
-            file=sys.stderr,
+            f"MATCH FOUND but notification failed for: {[e.url for e in undelivered]}"
         )
-        return 1
+        return EXIT_HARD_FAIL
     return 0
 
 
