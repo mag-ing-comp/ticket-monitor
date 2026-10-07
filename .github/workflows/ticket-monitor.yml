@@ -1,0 +1,44 @@
+name: Hajduk ticket monitor
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"  # every 10 min (runs can lag a few minutes under load)
+  workflow_dispatch:         # "Run workflow" button for manual tests
+
+permissions:
+  contents: write            # needed to commit seen.json back
+
+concurrency:
+  group: ticket-monitor      # never let two runs race on seen.json
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Check for tickets
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python check_tickets.py
+
+      - name: Persist seen events
+        run: |
+          if [ -n "$(git status --porcelain seen.json)" ]; then
+            git config user.name "ticket-bot"
+            git config user.email "ticket-bot@users.noreply.github.com"
+            git add seen.json
+            git commit -m "Record alerted event"
+            git push
+          fi
