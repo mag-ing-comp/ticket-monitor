@@ -1,33 +1,17 @@
 #!/usr/bin/env python3
 """
-Monitor buytickets.gi for relevant football ticket listings.
+BuyTickets Gibraltar football ticket monitor.
 
-Designed for scheduled execution through cron or GitHub Actions.
+- Fetches /events using curl
+- Parses events with BeautifulSoup
+- Matches configured football keywords
+- Sends ntfy / Telegram notifications
+- Tracks previously notified events
+- Alerts after consecutive failures
+- Sends recovery notifications
+- Continues running after failures
 
-Features:
-- Scan the /events page
-- Match event titles and URLs against configurable rules
-- Notify through ntfy and/or Telegram
-- Track previously alerted events in seen.json
-- Track consecutive failures in .failures
-- Send alerts after repeated failures
-- Send recovery notifications
-- Continue monitoring after failures
-- Log HTTP response diagnostics
-
-Environment variables:
-    NTFY_TOPIC
-    TELEGRAM_BOT_TOKEN
-    TELEGRAM_CHAT_ID
-    FAIL_ALERT_AFTER (default: 3)
-
-Exit codes:
-    0 = normal execution or handled soft failure
-    1 = failure threshold reached or critical notification failure
-
-Usage:
-    python check_tickets.py
-    python check_tickets.py --test-notify
+Cron scheduling is configured separately.
 """
 
 from __future__ import annotations
@@ -36,7 +20,10 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -52,7 +39,6 @@ from bs4 import BeautifulSoup
 
 BASE_URL = "https://www.buytickets.gi"
 
-# Monitor only the event listings page.
 PAGES_TO_SCAN = [
     f"{BASE_URL}/events",
 ]
@@ -60,28 +46,17 @@ PAGES_TO_SCAN = [
 STATE_FILE = Path(__file__).with_name("seen.json")
 FAIL_FILE = Path(__file__).with_name(".failures")
 
-# Configure via environment variable if desired.
 FAIL_ALERT_AFTER = max(1, int(os.getenv("FAIL_ALERT_AFTER", "3")))
 
 EXIT_SOFT_FAIL = 1
 EXIT_HARD_FAIL = 2
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-GB,en;q=0.9",
-}
+CURL_TIMEOUT = 20
 
 
 # ============================================================
 # EVENT MATCHING
 # ============================================================
-
-# An event matches when every term in at least one rule
-# appears in its normalized title or URL.
 
 MATCH_RULES: list[set[str]] = [
     # Opponent
@@ -109,6 +84,7 @@ ALL_KEYWORDS = sorted({term for rule in MATCH_RULES for term in rule})
 
 def normalize(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
+
     return "".join(c for c in text if not unicodedata.combining(c)).lower()
 
 
@@ -138,7 +114,6 @@ def is_match(event: Event) -> bool:
 
 EVENT_URL_RE = re.compile(r"/events?/[^/]+-\d+/?$", re.I)
 
-# Preserve HTTP responses for diagnostics.
 RAW_PAGES: list[requests.Response] = []
 
 
@@ -148,11 +123,7 @@ RAW_PAGES: list[requests.Response] = []
 
 
 def diagnose() -> None:
-    """
-    Display diagnostic information from received pages.
-
-    This does not make additional HTTP requests.
-    """
+    """Log details from responses without new requests."""
 
     if not RAW_PAGES:
         print("Diagnostics: no HTTP responses available.")
@@ -192,11 +163,7 @@ def diagnose() -> None:
 
 
 def is_bot_challenge(response: requests.Response) -> bool:
-    """
-    Detect known challenge-page indicators.
-
-    Other access restrictions may not be detected.
-    """
+    """Detect selected challenge-page indicators."""
 
     return "sgcaptcha" in response.text.lower() or (
         response.status_code == 202 and len(response.text) < 1000
@@ -204,31 +171,145 @@ def is_bot_challenge(response: requests.Response) -> bool:
 
 
 # ============================================================
-# FETCH EVENTS
+# CURL HTTP FETCHING
 # ============================================================
 
 
-def fetch_events(session: requests.Session) -> list[Event]:
+def fetch_with_curl(url: str) -> requests.Response:
+    """
+    Retrieve HTML using the curl executable.
+
+    Returns a requests-compatible Response object so that
+    existing diagnostic and error-handling functions work.
+
+    HTTP errors are surfaced through response.raise_for_status().
+    """
+
+    curl_path = shutil.which("curl")
+
+    if not curl_path:
+        raise requests.RequestException("curl executable was not found.")
+
+    print(f"Fetching with curl: {url}")
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        body_path = Path(temp_dir) / "body.html"
+        header_path = Path(temp_dir) / "headers.txt"
+
+        command = [
+            curl_path,
+            "--silent",
+            "--show-error",
+            "--location",
+            "--max-time",
+            str(CURL_TIMEOUT),
+            "--connect-timeout",
+            "10",
+            "--output",
+            str(body_path),
+            "--dump-header",
+            str(header_path),
+            "--write-out",
+            "%{http_code}\n%{url_effective}\n",
+            url,
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=CURL_TIMEOUT + 5,
+                check=False,
+            )
+
+        except subprocess.TimeoutExpired as exc:
+            raise requests.RequestException("curl execution timed out.") from exc
+
+        except OSError as exc:
+            raise requests.RequestException(f"Could not execute curl: {exc}") from exc
+
+        if result.returncode != 0:
+            raise requests.RequestException(
+                f"curl failed (exit {result.returncode}): "
+                f"{result.stderr.strip()[:300]}"
+            )
+
+        metadata = result.stdout.strip().splitlines()
+
+        if len(metadata) < 2:
+            raise requests.RequestException("curl returned invalid HTTP metadata.")
+
+        try:
+            status_code = int(metadata[0])
+
+        except ValueError as exc:
+            raise requests.RequestException(
+                "curl returned an invalid HTTP status."
+            ) from exc
+
+        final_url = metadata[1]
+
+        content = body_path.read_bytes()
+
+        # Parse headers from the final HTTP response.
+        raw_headers = header_path.read_text(encoding="iso-8859-1", errors="replace")
+
+        header_blocks = re.split(r"\r?\n\r?\n", raw_headers.strip())
+
+        headers = {}
+
+        for block in reversed(header_blocks):
+            lines = block.splitlines()
+
+            if not lines or not lines[0].startswith("HTTP/"):
+                continue
+
+            for line in lines[1:]:
+                if ":" in line:
+                    key, value = line.split(":", 1)
+                    headers[key.strip()] = value.strip()
+
+            break
+
+    # Build a requests-compatible response.
+    response = requests.Response()
+
+    response.status_code = status_code
+    response.url = final_url
+    response._content = content
+    response.headers.update(headers)
+    response.encoding = (
+        requests.utils.get_encoding_from_headers(response.headers) or "utf-8"
+    )
+
+    print(
+        f"HTTP {response.status_code} | "
+        f"{response.url} | "
+        f"{len(response.content)} bytes | "
+        f"Server: {response.headers.get('Server', 'unknown')}"
+    )
+
+    return response
+
+
+# ============================================================
+# FETCH AND PARSE EVENTS
+# ============================================================
+
+
+def fetch_events() -> list[Event]:
 
     events: dict[str, Event] = {}
 
     for page in PAGES_TO_SCAN:
 
-        print(f"Fetching: {page}")
+        response = fetch_with_curl(page)
 
-        response = session.get(page, headers=HEADERS, timeout=20)
-
-        # Preserve response BEFORE raising HTTP errors.
+        # Preserve response for diagnostics, including errors.
         RAW_PAGES.append(response)
 
-        print(
-            f"HTTP {response.status_code} | "
-            f"{response.url} | "
-            f"{len(response.content)} bytes | "
-            f"Server: {response.headers.get('Server', 'unknown')}"
-        )
-
-        # Raise an exception on 4xx or 5xx responses.
+        # Raises an HTTPError for 4xx or 5xx responses.
         response.raise_for_status()
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -249,8 +330,7 @@ def fetch_events(session: requests.Session) -> list[Event]:
 
             date = str(h5.next_sibling).strip() if h5 and h5.next_sibling else ""
 
-            # Deduplicate event links.
-            # Prefer entries containing a date.
+            # Deduplicate event URLs.
             if href not in events or (date and not events[href].date):
                 events[href] = Event(title=title, url=href, date=date)
 
@@ -266,7 +346,6 @@ def notify(title: str, body: str, url: str = "") -> bool:
 
     sent = False
 
-    # Support topic name or full ntfy URL.
     topic = (os.getenv("NTFY_TOPIC") or "").strip().rstrip("/").split("/")[-1]
 
     if not topic:
@@ -353,14 +432,11 @@ def save_seen(seen: set[str]) -> None:
 
 def track_failures(rc: int) -> int:
     """
-    Count consecutive unsuccessful checks.
-
-    Send one failure alert upon reaching the threshold.
+    Track consecutive failures and send a notification
+    when the alert threshold is first reached.
 
     Continue scheduled monitoring after the alert.
-
-    Send a recovery notification once a successful
-    check follows an alerted failure sequence.
+    Send recovery notification on a subsequent success.
     """
 
     try:
@@ -369,7 +445,6 @@ def track_failures(rc: int) -> int:
     except ValueError:
         n = 0
 
-    # Successful check.
     if rc == 0:
 
         if n >= FAIL_ALERT_AFTER:
@@ -386,7 +461,7 @@ def track_failures(rc: int) -> int:
 
         return 0
 
-    # Failed check.
+    # Unsuccessful check.
     n += 1
 
     FAIL_FILE.write_text(str(n))
@@ -430,12 +505,10 @@ def track_failures(rc: int) -> int:
 
 def run_check() -> int:
 
-    # Clear diagnostics from any previous invocation.
     RAW_PAGES.clear()
 
     try:
-        with requests.Session() as session:
-            events = fetch_events(session)
+        events = fetch_events()
 
     except requests.RequestException as e:
 
@@ -446,14 +519,13 @@ def run_check() -> int:
 
         else:
             print(
-                "No HTTP response received. " "Possible connection or timeout failure."
+                "No HTTP response available. " "Possible curl/network/timeout failure."
             )
 
         return EXIT_SOFT_FAIL
 
     seen = load_seen()
 
-    # No events found.
     if not events:
 
         if any(is_bot_challenge(r) for r in RAW_PAGES):
@@ -464,7 +536,7 @@ def run_check() -> int:
 
         diagnose()
 
-        # Raw-text fallback from the original script.
+        # Preserve the raw-text fallback.
         for response in RAW_PAGES:
 
             key = f"raw:{response.url}"
@@ -484,7 +556,6 @@ def run_check() -> int:
 
         return EXIT_SOFT_FAIL
 
-    # Find newly matching events.
     hits = [event for event in events if is_match(event) and event.url not in seen]
 
     print(f"Scanned {len(events)} events, " f"{len(hits)} new match(es).")
@@ -500,13 +571,11 @@ def run_check() -> int:
         message = f"{event.title}{when}\n" f"Matched: {keywords}"
 
         if notify("Hajduk tickets are LIVE on buytickets.gi", message, event.url):
-            # Record only after successful notification.
             seen.add(event.url)
 
     if hits:
         save_seen(seen)
 
-    # Check for notifications that weren't delivered.
     undelivered = [event for event in hits if event.url not in seen]
 
     if undelivered:
@@ -548,7 +617,6 @@ def main() -> int:
 
     rc = run_check()
 
-    # Preserve critical notification-failure behavior.
     if rc == EXIT_HARD_FAIL:
 
         print("Critical: matching event detected " "but notification failed.")
